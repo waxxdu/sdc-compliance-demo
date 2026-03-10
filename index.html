@@ -294,6 +294,10 @@ const SCENARIOS = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function callClaudeAgent(userText) {
+  // Uses a CORS proxy to forward to Anthropic API
+  // In production: deploy your own proxy endpoint
+  const PROXY = "https://corsproxy.io/?url=https://api.anthropic.com/v1/messages";
+
   const systemPrompt = `You are a Specification-Driven Compliance (SDC) agent.
 Your job: Convert regulatory text or compliance requirements into executable OPA Rego policies AND a matching JavaScript evaluator function.
 
@@ -317,20 +321,43 @@ Rules:
 - input_fields defines what the user needs to fill in to test this policy
 - Be specific, not generic. The spec must be testable with binary logic.`;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userText }]
-    })
-  });
-  const data = await response.json();
-  const text = data.content?.[0]?.text || "";
-  const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
+  // N8N proxy endpoint - handles CORS and forwards to Anthropic
+  const N8N_PROXY = "https://n8n.cosmos.tumaki.de/webhook/sdc-spec-generator";
+
+  // Try n8n proxy first, then direct (works in Claude artifacts)
+  const endpoints = [N8N_PROXY, "https://api.anthropic.com/v1/messages"];
+
+  let lastError = null;
+  for (const endpoint of endpoints) {
+    try {
+      const isProxy = endpoint === N8N_PROXY;
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(isProxy
+          ? { userText, systemPrompt }  // n8n expects wrapped payload
+          : {                           // Anthropic expects direct format
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 1000,
+              system: systemPrompt,
+              messages: [{ role: "user", content: userText }]
+            }
+        )
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      // n8n returns {result: "..."} or Anthropic returns {content: [...]}
+      const text = isProxy
+        ? (data.result || data.content?.[0]?.text || "")
+        : (data.content?.[0]?.text || "");
+      const clean = text.replace(/```json|```/g, "").trim();
+      return JSON.parse(clean);
+    } catch(e) {
+      lastError = e;
+      continue;
+    }
+  }
+  throw new Error("Spec Generator nicht erreichbar. Details: " + lastError?.message);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
